@@ -63,6 +63,8 @@ class ArucoTaskEnv(DirectRLEnv):
 
         self.wheel_radius = 0.033  # in meters
         self.axle_length = 0.3     # distance between wheels (adjust as needed)
+        self.max_speed = 100  # max speed in m/s
+        self.max_angular_speed = 1  # max angular speed in rad/s
     
 
     def _setup_scene(self):
@@ -70,19 +72,20 @@ class ArucoTaskEnv(DirectRLEnv):
 
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        light_cfg = DomeLightCfg(intensity=5000.0, color=(1.0, 1.0, 1.0))
+        light_cfg = DomeLightCfg(intensity=2000.0, color=(1.0, 1.0, 1.0))
         light_cfg.func("/World/Light", light_cfg)
 
         self.camera = Camera(CameraCfg(
             prim_path=(
                 "/World/envs/env_0/Robot/chassis_link/camera_mount/carter_camera_third_person"
             ),
-            width=256,
-            height=256,
+            width=500,
+            height=500,
             data_types=["rgb"],
-            spawn = None
+            spawn = None,
             
         ))
+        
     
 
 
@@ -100,43 +103,52 @@ class ArucoTaskEnv(DirectRLEnv):
 
 
     def _apply_action(self):
-        # Action = [linear_vel, angular_vel]
-        v = self.actions[:, 0]  # forward velocity
-        w = self.actions[:, 1]  # angular velocity
+        self.robot.write_joint_damping_to_sim(damping=1.0, joint_ids=[self._left_wheel_idx[0], self._right_wheel_idx[0]])
 
-        
-        # Differential drive conversion
+    # Scale actions from [-1, 1] to velocity targets
+        v = self.max_speed * self.actions[:, 0] # m/s
+        w = self.max_angular_speed * self.actions[:, 1]  # rad/s
+
+        # Differential drive: linear + angular velocity → wheel linear velocity
         v_l = v - (self.axle_length / 2.0) * w
         v_r = v + (self.axle_length / 2.0) * w
 
-        # Convert to angular velocity (rad/s) for wheels
-        target_l = v_l / self.wheel_radius
-        target_r = v_r / self.wheel_radius
-        wheel_targets = torch.stack([target_l, target_r], dim=1)
+        # Convert to angular velocity (rad/s)
+        target_vel_l = v_l / self.wheel_radius
+        target_vel_r = v_r / self.wheel_radius
+        target_vel = torch.stack([target_vel_l, target_vel_r], dim=1)
+
+        # Get current angular velocities from simulation
+        current_vel = self.robot.data.joint_vel[:, [self._left_wheel_idx[0], self._right_wheel_idx[0]]]
+        print(current_vel)
 
 
+        # Clamp torque to physical limits
+        max_torque = 2.0  # Set this to your robot’s safe max torque
+        torque_cmd = torch.clamp(target_vel, -max_torque, max_torque)
 
-
-        # Apply as target joint velocity (use effort target if doing torque control later)
+        # Apply the torque commands
         self.robot.set_joint_effort_target(
-            wheel_targets,
-            joint_ids=[self._left_wheel_idx[0], self._right_wheel_idx[0]]
+            target=torque_cmd,
+            joint_ids=[int(self._left_wheel_idx[0]), int(self._right_wheel_idx[0])]
         )
+        self.robot.write_data_to_sim()
 
 
     def _get_observations(self) -> dict:
 
 
-        raw_camera_data = self.camera.data.output["rgb"] / 255.0 
+        raw_camera_data = self.camera.data.output["rgb"]
+        norm_camera_data = raw_camera_data / 255.0 
             # normalize the camera data for better training results
-        mean_tensor = torch.mean(raw_camera_data, dim=(1, 2), keepdim=True)
+        mean_tensor = torch.mean(norm_camera_data, dim=(1, 2), keepdim=True)
         camera_data = raw_camera_data - mean_tensor
         observations = {"policy": raw_camera_data.clone()}
-        print("[DEBUG] Camera mean pixel:", raw_camera_data.mean().item())
+        #print("[DEBUG] Camera mean pixel:", raw_camera_data.mean().item())
 
     
         if self.episode_length_buf % 50 == 0:    
-            save_images_to_file(camera_data, f"cartpole_rgb.png")
+            save_images_to_file(norm_camera_data, f"cartpole_rgb.png")
             print("[DEBUG] Saved first RGB frame to disk.")
 
 
