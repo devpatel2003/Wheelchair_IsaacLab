@@ -25,8 +25,8 @@ class ArucoTaskEnvCfg(DirectRLEnvCfg):
 
     # Scene configuration
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=1,
-        env_spacing=4.0,
+        num_envs=16,
+        env_spacing=12.0,
         replicate_physics=True,
     )
 

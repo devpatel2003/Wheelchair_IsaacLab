@@ -1,0 +1,30 @@
+<robot name="aruco_tag">
+
+  <link name="aruco_marker">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.1 0.1 0.001"/> <!-- 10cm x 10cm tag -->
+      </geometry>
+      <material name="aruco_texture">
+        <texture filename="../aruco_0.png"/>
+      </material>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.1 0.1 0.001"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <mass value="0.01"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1e-5" ixy="0.0" ixz="0.0"
+               iyy="1e-5" iyz="0.0"
+               izz="1e-5"/>
+    </inertial>
+  </link>
+
+</robot>

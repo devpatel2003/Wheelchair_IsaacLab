@@ -3,8 +3,9 @@ import math
 import numpy as np
 import cv2
 import cv2.aruco as aruco
+import omni.usd
+from pxr import UsdGeom
 from collections.abc import Sequence
-import omni.replicator.core as rep
 
 from isaaclab.envs import DirectRLEnv
 from isaaclab.assets import Articulation
@@ -19,17 +20,16 @@ from isaaclab.sensors import Camera, CameraCfg, save_images_to_file
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
-
 from pathlib import Path
 import torchvision    
 
-
-
-
-
-
 from .aruco_task_env_cfg import ArucoTaskEnvCfg
 from .camera_manager import CameraManager
+
+import omni.usd
+from pxr import Usd, UsdGeom, UsdShade, Sdf, Vt, Gf
+import random
+
 
 
 
@@ -65,19 +65,220 @@ class ArucoTaskEnv(DirectRLEnv):
         self.axle_length = 0.3     # distance between wheels (adjust as needed)
         self.max_speed = 100  # max speed in m/s
         self.max_angular_speed = 1  # max angular speed in rad/s
+
+
     
+    def _spawn_tag(self, stage, env_index, image_path, seed=None):
+        """Spawns a flat textured plane with UVs on one side only (front-facing)."""
+        rng = random.Random(seed + env_index if seed is not None else None)
+
+        # Random position within 10×10 area (X, Y), height (Z)
+        x = rng.uniform(-5.0, 5.0)
+        y = rng.uniform(-5.0, 5.0)
+        z = rng.uniform(0.2, 1.1)
+        rot_z = rng.uniform(0.0, 360.0)  # Random rotation around Z-axis
+
+        # Paths
+        env_path = f"/World/envs/env_{env_index}"
+        plane_path = f"{env_path}/aruco_tag"
+        material_path = f"/World/Materials/ArucoMaterial_{env_index}"
+
+        # Create plane as a flat cube with 1 face
+        plane = UsdGeom.Mesh.Define(stage, plane_path)
+
+        # Vertices of a square plane in X-Y
+        points = [
+            Gf.Vec3f(-0.25, -0.25, 0.0),
+            Gf.Vec3f( 0.25, -0.25, 0.0),
+            Gf.Vec3f( 0.25,  0.25, 0.0),
+            Gf.Vec3f(-0.25,  0.25, 0.0),
+        ]
+
+        # Single quad face
+        face_vertex_counts = [4]
+        face_vertex_indices = [0, 1, 2, 3]
+
+        # UVs for face vertices
+        st = Vt.Vec2fArray([
+            Gf.Vec2f(1.0, 1.0),
+            Gf.Vec2f(1.0, 0.0),
+            Gf.Vec2f(0.0, 0.0),
+            Gf.Vec2f(0.0, 1.0),
+        ])
+
+        # Assign geometry
+        plane.CreatePointsAttr(points)
+        plane.CreateFaceVertexCountsAttr(face_vertex_counts)
+        plane.CreateFaceVertexIndicesAttr(face_vertex_indices)
+
+        # Assign UVs
+        prim = plane.GetPrim()
+        primvars_api = UsdGeom.PrimvarsAPI(prim)
+        uv_primvar = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+        uv_primvar.Set(st)
+        uv_primvar.SetInterpolation("faceVarying")
+
+        # 2. Create material
+        material = UsdShade.Material.Define(stage, material_path)
+
+        # 3. Texture shader
+        texture = UsdShade.Shader.Define(stage, material_path + "/Texture")
+        texture.CreateIdAttr("UsdUVTexture")
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(image_path)
+        texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+        # 4. Primvar reader
+        reader = UsdShade.Shader.Define(stage, material_path + "/PrimvarReader")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+        # 5. Connect UV → texture
+        texture.CreateInput("st", Sdf.ValueTypeNames.TexCoord2f).ConnectToSource(reader.GetOutput("result"))
+
+        # 6. Surface shader
+        shader = UsdShade.Shader.Define(stage, material_path + "/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Float3).ConnectToSource(texture.GetOutput("rgb"))
+        shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+
+        # 7. Bind material
+        material.CreateSurfaceOutput().ConnectToSource(shader.GetOutput("surface"))
+        UsdShade.MaterialBindingAPI(prim).Bind(material)
+
+        # 8. Transform in front of robot
+        UsdGeom.XformCommonAPI(plane).SetTranslate((x,y,z))
+        UsdGeom.XformCommonAPI(plane).SetRotate((0.0, 90.0, rot_z))
+        UsdGeom.XformCommonAPI(plane).SetScale((0.6, 0.6, 0.1))  # Width, thickness, height
+
+
+
+        print(f"[INFO] Textured plane added at {plane_path}")
+    
+    def spawn_walls(self, stage, env_index, area_size=10.0, wall_height=1.0, wall_thickness=0.1, wall_z=0.5):
+        """Spawn 4 walls around a 10x10 area for a single environment."""
+        half_size = area_size / 2.0
+        env_path = f"/World/envs/env_{env_index}"
+
+        wall_params = [
+            # Front (positive Y)
+            ("wall_front", (0.0, half_size + wall_thickness / 2.0, wall_z), (area_size, wall_thickness, wall_height)),
+            # Back (negative Y)
+            ("wall_back", (0.0, -half_size - wall_thickness / 2.0, wall_z), (area_size, wall_thickness, wall_height)),
+            # Right (positive X)
+            ("wall_right", (half_size + wall_thickness / 2.0, 0.0, wall_z), (wall_thickness, area_size, wall_height)),
+            # Left (negative X)
+            ("wall_left", (-half_size - wall_thickness / 2.0, 0.0, wall_z), (wall_thickness, area_size, wall_height)),
+        ]
+
+        for name, pos, scale in wall_params:
+            wall_path = f"{env_path}/{name}"
+            wall = UsdGeom.Cube.Define(stage, wall_path)
+            UsdGeom.XformCommonAPI(wall).SetTranslate(pos)
+            UsdGeom.XformCommonAPI(wall).SetScale(scale)
+
+    def randomize_ground_texture(self, stage, texture_paths, env_index=0):
+        # Choose one texture randomly
+        chosen_texture = random.choice(texture_paths)
+        print(f"[INFO] Randomly selected ground texture: {chosen_texture}")
+
+        ground_path = f"/World/envs/env_{env_index}/GroundPlane"
+        material_path = f"/World/envs/env_{env_index}/GroundMaterial"
+        shader_path = material_path + "/Shader"
+        texture_node_path = material_path + "/Texture"
+
+        # Get ground prim
+        ground_prim = stage.GetPrimAtPath(ground_path)
+        if not ground_prim.IsValid():
+            print(f"[WARNING] GroundPlane not found at {ground_path}")
+            return
+
+        # ✅ Add UV primvar
+        
+        primvars_api = UsdGeom.PrimvarsAPI(ground_prim)
+        uv_primvar = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+
+        # Basic UV mapping assuming quad ground mesh
+        uvs = Vt.Vec2fArray([
+            Gf.Vec2f(0.0, 0.0),
+            Gf.Vec2f(1.0, 0.0),
+            Gf.Vec2f(1.0, 1.0),
+            Gf.Vec2f(0.0, 1.0),
+        ])
+        uv_primvar.Set(uvs)
+        uv_primvar.SetInterpolation("faceVarying")
+
+        # ✅ Add Primvar Reader
+        reader = UsdShade.Shader.Define(stage, material_path + "/PrimvarReader")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+        # Create material + shader
+        material = UsdShade.Material.Define(stage, material_path)
+        shader = UsdShade.Shader.Define(stage, shader_path)
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+
+        # Texture shader
+        texture = UsdShade.Shader.Define(stage, texture_node_path)
+        texture.CreateIdAttr("UsdUVTexture")
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(chosen_texture)
+        texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        texture.CreateInput("st", Sdf.ValueTypeNames.TexCoord2f).ConnectToSource(reader.GetOutput("result"))
+
+        # Connect to shader
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Float3).ConnectToSource(texture.GetOutput("rgb"))
+        material.CreateSurfaceOutput().ConnectToSource(shader.GetOutput("surface"))
+
+        # Bind to ground
+        UsdShade.MaterialBindingAPI(ground_prim).Bind(material)
+        UsdGeom.XformCommonAPI(ground_prim).SetScale((1, 1, 0.1))  # Width, thickness, height
+
+    def _create_uv_ground(self, stage, env_index=0):
+        ground_path = f"/World/envs/env_{env_index}/GroundPlane"
+        mesh = UsdGeom.Mesh.Define(stage, ground_path)
+
+        # Create quad vertices for a 10x10 plane
+        half_size = 5.0
+        points = [
+            Gf.Vec3f(-half_size, -half_size, 0.0),
+            Gf.Vec3f( half_size, -half_size, 0.0),
+            Gf.Vec3f( half_size,  half_size, 0.0),
+            Gf.Vec3f(-half_size,  half_size, 0.0),
+        ]
+        indices = [0, 1, 2, 3]
+        counts = [4]
+
+        mesh.CreatePointsAttr(points)
+        mesh.CreateFaceVertexIndicesAttr(indices)
+        mesh.CreateFaceVertexCountsAttr(counts)
+
+        # UVs
+        primvars_api = UsdGeom.PrimvarsAPI(mesh)
+        uvs = Vt.Vec2fArray([
+            Gf.Vec2f(0.0, 0.0),
+            Gf.Vec2f(1.0, 0.0),
+            Gf.Vec2f(1.0, 1.0),
+            Gf.Vec2f(0.0, 1.0),
+        ])
+        uv_primvar = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+        uv_primvar.Set(uvs)
+        uv_primvar.SetInterpolation("faceVarying")
+
+        UsdGeom.XformCommonAPI(mesh).SetTranslate((0.0, 0.0, 0.005))
+
 
     def _setup_scene(self):
-        self.robot = Articulation(self.cfg.robot_cfg)
 
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        self.robot = Articulation(self.cfg.robot_cfg)
 
         light_cfg = DomeLightCfg(intensity=2000.0, color=(1.0, 1.0, 1.0))
         light_cfg.func("/World/Light", light_cfg)
 
         self.camera = Camera(CameraCfg(
             prim_path=(
-                "/World/envs/env_0/Robot/chassis_link/camera_mount/carter_camera_third_person"
+                "/World/envs/env_0/Robot/chassis_link/camera_mount/carter_camera_first_person"
             ),
             width=500,
             height=500,
@@ -86,18 +287,32 @@ class ArucoTaskEnv(DirectRLEnv):
             
         ))
         
-    
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
+
+        ASSET_TAG_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "assets" / "tag"
+        ARUCO_IMAGE_PATH = (ASSET_TAG_ROOT / "aruco_0.png").as_posix()  # Safe for USD
+        ASSET_GROUND_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "assets" / "ground"
+        TEXTURE_PATHS = [str(p) for ext in ("*.png", "*.jpg", "*.jpeg") for p in ASSET_GROUND_ROOT.glob(ext)]
+        stage = omni.usd.get_context().get_stage()
+        for i in range(self.num_envs):
+            ground_path = f"/World/envs/env_{i}/GroundPlane"
+            ground_cfg = GroundPlaneCfg(size=(10.0, 10.0), visible=True)
+            self._spawn_tag(stage, env_index=i, image_path=ARUCO_IMAGE_PATH)
+            self.spawn_walls(stage, env_index=i)
+            self._create_uv_ground(stage, env_index=i)
+            self.randomize_ground_texture(stage, TEXTURE_PATHS, env_index=i)
 
         self.scene.clone_environments(copy_from_source=False)
         self.scene.articulations["robot"] = self.robot
         #self.camera  = self.scene.sensors["fpv"]          # ← add this line
+        print(f"[INFO] started scene setup with {self.num_envs} environments.")
 
 
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
-        self.actions = torch.tensor([[1.0, 0.0]], device=self.device)  # Fixed action for testing
+        self.actions = torch.tensor([[0.0, 0.0]], device=self.device)  # Fixed action for testing
         
 
 
@@ -120,7 +335,6 @@ class ArucoTaskEnv(DirectRLEnv):
 
         # Get current angular velocities from simulation
         current_vel = self.robot.data.joint_vel[:, [self._left_wheel_idx[0], self._right_wheel_idx[0]]]
-        print(current_vel)
 
 
         # Clamp torque to physical limits
@@ -146,10 +360,6 @@ class ArucoTaskEnv(DirectRLEnv):
         observations = {"policy": raw_camera_data.clone()}
         #print("[DEBUG] Camera mean pixel:", raw_camera_data.mean().item())
 
-    
-        if self.episode_length_buf % 50 == 0:    
-            save_images_to_file(norm_camera_data, f"cartpole_rgb.png")
-            print("[DEBUG] Saved first RGB frame to disk.")
 
 
 
@@ -235,3 +445,5 @@ class ArucoTaskEnv(DirectRLEnv):
             heading_error = torch.tensor(math.atan2(tag_cam[0], tag_cam[2]), device=self.device)
 
         return torch.tensor(aruco_obs, device=self.device), tag_range, heading_error
+    
+    
