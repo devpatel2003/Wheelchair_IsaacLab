@@ -1,1 +1,2 @@
+conda activate isaaclab
 python scripts\random_agent.py --task=Aruco-Wheelchairrl-Direct-v0 --enable_cameras

@@ -27,8 +27,9 @@ from .aruco_task_env_cfg import ArucoTaskEnvCfg
 from .camera_manager import CameraManager
 
 import omni.usd
-from pxr import Usd, UsdGeom, UsdShade, Sdf, Vt, Gf
+from pxr import Usd, UsdGeom, UsdShade, Sdf, Vt, Gf, UsdPhysics
 import random
+from gymnasium import spaces
 
 
 
@@ -38,6 +39,13 @@ class ArucoTaskEnv(DirectRLEnv):
 
     def __init__(self, cfg: ArucoTaskEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+
+        self.action_space = spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            shape=(2,),
+            dtype=np.float32,
+        )
 
         self._target_pos = torch.tensor([5.0, 0.0, 0.0], device=self.device)
         self._collision = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -176,6 +184,8 @@ class ArucoTaskEnv(DirectRLEnv):
             wall = UsdGeom.Cube.Define(stage, wall_path)
             UsdGeom.XformCommonAPI(wall).SetTranslate(pos)
             UsdGeom.XformCommonAPI(wall).SetScale(scale)
+            UsdPhysics.CollisionAPI.Apply(wall.GetPrim())
+
 
     def randomize_ground_texture(self, stage, texture_paths, env_index=0):
         # Choose one texture randomly
@@ -312,7 +322,8 @@ class ArucoTaskEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
-        self.actions = torch.tensor([[0.0, 0.0]], device=self.device)  # Fixed action for testing
+        print(f"Actions: {self.actions}")
+        #self.actions = torch.tensor([[1.0, 0.0]], device=self.device)  # Fixed action for testing
         
 
 
@@ -321,8 +332,11 @@ class ArucoTaskEnv(DirectRLEnv):
         self.robot.write_joint_damping_to_sim(damping=1.0, joint_ids=[self._left_wheel_idx[0], self._right_wheel_idx[0]])
 
     # Scale actions from [-1, 1] to velocity targets
-        v = self.max_speed * self.actions[:, 0] # m/s
-        w = self.max_angular_speed * self.actions[:, 1]  # rad/s
+        scale_v = 5.0 * self.wheel_radius                      # → ~0.33
+        scale_w = 10.0 * self.wheel_radius / (self.axle_length / 2.0)  # → ~2.2
+
+        v = scale_v * self.actions[:, 0]  # scaled linear velocity
+        w = scale_w * self.actions[:, 1]  # scaled angular velocity
 
         # Differential drive: linear + angular velocity → wheel linear velocity
         v_l = v - (self.axle_length / 2.0) * w
@@ -332,18 +346,18 @@ class ArucoTaskEnv(DirectRLEnv):
         target_vel_l = v_l / self.wheel_radius
         target_vel_r = v_r / self.wheel_radius
         target_vel = torch.stack([target_vel_l, target_vel_r], dim=1)
+        #print(f"[DEBUG] Target velocities: {target_vel}")
 
         # Get current angular velocities from simulation
         current_vel = self.robot.data.joint_vel[:, [self._left_wheel_idx[0], self._right_wheel_idx[0]]]
 
 
         # Clamp torque to physical limits
-        max_torque = 2.0  # Set this to your robot’s safe max torque
+        max_torque = 10.0  # Set this to your robot’s safe max torque
         torque_cmd = torch.clamp(target_vel, -max_torque, max_torque)
-
         # Apply the torque commands
         self.robot.set_joint_effort_target(
-            target=torque_cmd,
+            target=target_vel,
             joint_ids=[int(self._left_wheel_idx[0]), int(self._right_wheel_idx[0])]
         )
         self.robot.write_data_to_sim()

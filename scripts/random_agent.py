@@ -58,6 +58,7 @@ def main():
         with torch.inference_mode():
             # sample actions from -1 to 1
             actions = torch.rand(env.action_space.shape, device=env.unwrapped.device)
+            #print(f"[INFO]: Sampled actions: {actions}")
             #env.unwrapped._world.step(render=True)
             env.step(actions)
 
